@@ -22,7 +22,7 @@ except ImportError:
     HAS_RUMPS = False
 
 PLAYCOVER_DB = Path.home() / "Library/Containers/io.playcover.PlayCover/PlayChain/com.duosecurity.DuoMobile.db"
-MENUBAR_ICON = Path(__file__).parent / "duo_icon_v3.png"
+MENUBAR_ICON = Path(__file__).parent / "duo_icon.png"
 DUO_APP_PATH = Path.home() / "Library/Containers/io.playcover.PlayCover/Applications/com.duosecurity.DuoMobile.app"
 
 
