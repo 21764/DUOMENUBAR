@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Duo Mobile Menu Bar App - Diagnostic Mode
-Generates multiple TOTP variants to identify correct parameters.
+Duo Mobile Menu Bar App
+Displays TOTP codes from PlayCover's Duo Mobile in the macOS menu bar.
 """
 
 import sqlite3
@@ -12,7 +12,6 @@ import hashlib
 import struct
 import subprocess
 import os
-import base64
 from pathlib import Path
 
 try:
@@ -23,41 +22,93 @@ except ImportError:
 
 PLAYCOVER_DB = Path.home() / "Library/Containers/io.playcover.PlayCover/PlayChain/com.duosecurity.DuoMobile.db"
 MENUBAR_ICON = Path(__file__).parent / "duo_icon_v3.png"
+DUO_APP_PATH = Path.home() / "Library/Containers/io.playcover.PlayCover/Applications/com.duosecurity.DuoMobile.app"
 
 
-def get_digest_mod(algorithm: str):
-    algo = algorithm.upper()
-    if algo == 'SHA256': return hashlib.sha256
-    if algo == 'SHA512': return hashlib.sha512
-    return hashlib.sha1
+def hotp(secret_bytes: bytes, counter: int, digits: int = 6) -> str:
+    """Generate HOTP code."""
+    hmac_hash = hmac.new(secret_bytes, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = hmac_hash[-1] & 0x0F
+    binary = struct.unpack(">I", hmac_hash[offset:offset + 4])[0] & 0x7FFFFFFF
+    return str(binary % (10 ** digits)).zfill(digits)
 
 
-def hotp(secret_bytes: bytes, counter: int, digits: int = 6, digest=hashlib.sha1) -> str:
-    try:
-        hmac_hash = hmac.new(secret_bytes, struct.pack(">Q", counter), digest).digest()
-        offset = hmac_hash[-1] & 0x0F
-        binary = struct.unpack(">I", hmac_hash[offset:offset + 4])[0] & 0x7FFFFFFF
-        return str(binary % (10 ** digits)).zfill(digits)
-    except:
-        return "ERROR"
-
-
-def totp(secret_bytes: bytes, digits: int = 6, period: int = 30, algorithm: str = 'SHA1') -> str:
+def totp(secret: str, digits: int = 6, period: int = 30) -> str:
+    """Generate TOTP code using Raw/6 method (secret as UTF-8 bytes)."""
+    secret_bytes = secret.encode('utf-8')
     counter = int(time.time()) // period
-    digest = get_digest_mod(algorithm)
-    return hotp(secret_bytes, counter, digits, digest)
+    return hotp(secret_bytes, counter, digits)
 
 
 def time_remaining(period: int = 30) -> int:
+    """Get seconds remaining until next TOTP refresh."""
     return period - (int(time.time()) % period)
 
 
 def copy_to_clipboard(text: str):
+    """Copy text to macOS clipboard."""
     subprocess.run(['pbcopy'], input=text.encode('utf-8'))
 
 
-def get_db_accounts() -> list:
+def is_duo_running() -> bool:
+    """Check if Duo Mobile app is running."""
+    result = subprocess.run(
+        ['pgrep', '-f', 'com.duosecurity.DuoMobile'],
+        capture_output=True
+    )
+    return result.returncode == 0
+
+
+def open_duo_app():
+    """Open Duo Mobile via PlayCover using AppleScript and cliclick."""
+    # First, open and activate PlayCover
+    subprocess.run(['open', '-a', 'PlayCover'])
+    time.sleep(1)
+
+    # Use AppleScript to get Duo element position
+    script = '''
+    tell application "PlayCover"
+        activate
+    end tell
+
+    delay 0.5
+
+    tell application "System Events"
+        tell process "PlayCover"
+            try
+                set duoElement to UI element 1 of scroll area 1 of group 2 of splitter group 1 of group 1 of window 1
+                set {xPos, yPos} to position of duoElement
+                set {xSize, ySize} to size of duoElement
+                set centerX to (xPos + (xSize / 2)) as integer
+                set centerY to (yPos + (ySize / 2)) as integer
+                return (centerX as text) & "," & (centerY as text)
+            on error
+                return "error"
+            end try
+        end tell
+    end tell
+    '''
+
+    result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
+    position = result.stdout.strip()
+
+    if position and position != "error" and "," in position:
+        # Use cliclick to double-click at position
+        subprocess.run(['cliclick', f'dc:{position}'])
+
+
+def ensure_duo_running():
+    """Make sure Duo app is running, open it if not."""
+    if not is_duo_running():
+        open_duo_app()
+        # Wait a bit for app to start and populate database
+        time.sleep(3)
+
+
+def get_duo_accounts() -> list:
+    """Read Duo accounts from PlayCover database."""
     accounts = []
+
     if not PLAYCOVER_DB.exists():
         return accounts
 
@@ -69,20 +120,20 @@ def get_db_accounts() -> list:
         for row in cursor.fetchall():
             try:
                 data = json.loads(row[0])
-                secret_raw = data.get('otpSecretKeyNew') or data.get('otpSecretKey')
+                secret = data.get('otpSecretKeyNew') or data.get('otpSecretKey')
 
-                if secret_raw:
-                    name = data.get('displayLabel', 'Unknown')
+                if secret:
                     accounts.append({
-                        'name': name,
-                        'raw_secret': secret_raw,
-                        'period': int(data.get('otpPeriod', 30))
+                        'name': data.get('displayLabel', data.get('accountName', 'Unknown')),
+                        'secret': secret,
                     })
-            except:
+            except (json.JSONDecodeError, KeyError):
                 continue
+
         conn.close()
-    except:
+    except sqlite3.Error:
         pass
+
     return accounts
 
 
@@ -91,58 +142,44 @@ if HAS_RUMPS:
         def __init__(self):
             icon_path = str(MENUBAR_ICON) if MENUBAR_ICON.exists() else None
             super().__init__("", icon=icon_path, quit_button=None, template=False)
-            self.accounts = get_db_accounts()
+
+            # Ensure Duo is running on startup
+            ensure_duo_running()
+
+            self.accounts = get_duo_accounts()
             self.timer = rumps.Timer(self.refresh_codes, 1)
             self.timer.start()
             self.refresh_codes(None)
 
         def refresh_codes(self, _):
-            rem = time_remaining(30)
+            """Refresh all TOTP codes."""
+            remaining = time_remaining()
             menu_items = []
 
+            # Check if we have accounts, if not try to refresh
             if not self.accounts:
-                menu_items.append(rumps.MenuItem("No Accounts Found"))
+                if is_duo_running():
+                    self.accounts = get_duo_accounts()
 
-            for acc in self.accounts:
-                s_raw = acc['raw_secret']
+                if not self.accounts:
+                    menu_items.append(rumps.MenuItem("No Accounts Found"))
+                    menu_items.append(rumps.MenuItem("Open PlayCover", callback=self.open_duo))
 
-                # Variant 1: Hex Decode (Standard)
-                try:
-                    b_hex = bytes.fromhex(s_raw)
-                    c_hex_6 = totp(b_hex, digits=6)
-                    c_hex_8 = totp(b_hex, digits=8)
-                    c_hex_256 = totp(b_hex, algorithm='SHA256')
+            for account in self.accounts:
+                code = totp(account['secret'])
+                formatted_code = f"{code[:3]} {code[3:]}"
 
-                    menu_items.append(rumps.MenuItem(f"{acc['name']} [Hex/6]: {c_hex_6[:3]} {c_hex_6[3:]}",
-                                                     callback=lambda _, c=c_hex_6: self.copy_code(c)))
-                    menu_items.append(rumps.MenuItem(f"{acc['name']} [Hex/8]: {c_hex_8}",
-                                                     callback=lambda _, c=c_hex_8: self.copy_code(c)))
-                    menu_items.append(rumps.MenuItem(f"{acc['name']} [Hex/SHA256]: {c_hex_256}",
-                                                     callback=lambda _, c=c_hex_256: self.copy_code(c)))
-                except:
-                    pass
+                item = rumps.MenuItem(
+                    f"{account['name']}: {formatted_code}",
+                    callback=lambda _, c=code: self.copy_code(c)
+                )
+                menu_items.append(item)
 
-                # Variant 2: Raw Bytes (Treat string as bytes)
-                b_raw = s_raw.encode('utf-8')
-                c_raw_6 = totp(b_raw, digits=6)
-                menu_items.append(rumps.MenuItem(f"{acc['name']} [Raw/6]: {c_raw_6[:3]} {c_raw_6[3:]}",
-                                                 callback=lambda _, c=c_raw_6: self.copy_code(c)))
-
-                # Variant 3: Base64 (if it looks plausible)
-                try:
-                    s_b64 = s_raw + '=' * ((4 - len(s_raw) % 4) % 4)
-                    b_b64 = base64.b64decode(s_b64)
-                    if len(b_b64) > 8:
-                        c_b64_6 = totp(b_b64, digits=6)
-                        menu_items.append(rumps.MenuItem(f"{acc['name']} [B64/6]: {c_b64_6[:3]} {c_b64_6[3:]}",
-                                                         callback=lambda _, c=c_b64_6: self.copy_code(c)))
-                except:
-                    pass
-
-                menu_items.append(None)  # Separator
-
-            menu_items.append(rumps.MenuItem(f"Refreshes in {rem}s"))
-            menu_items.append(rumps.MenuItem("Refresh", callback=self.manual_refresh))
+            menu_items.append(None)  # Separator
+            menu_items.append(rumps.MenuItem(f"Refreshes in {remaining}s"))
+            menu_items.append(None)  # Separator
+            menu_items.append(rumps.MenuItem("Open PlayCover", callback=self.open_duo))
+            menu_items.append(rumps.MenuItem("Refresh Accounts", callback=self.manual_refresh))
             menu_items.append(rumps.MenuItem("Quit", callback=rumps.quit_application))
 
             self.menu.clear()
@@ -153,45 +190,63 @@ if HAS_RUMPS:
             self.title = ""
 
         def copy_code(self, code):
+            """Copy code to clipboard."""
             copy_to_clipboard(code)
             rumps.notification("Duo Code Copied", "", f"Code {code} copied to clipboard")
 
+        def open_duo(self, _):
+            """Open Duo app."""
+            open_duo_app()
+            # Wait and refresh accounts
+            time.sleep(3)
+            self.manual_refresh(None)
+
         def manual_refresh(self, _):
-            self.accounts = get_db_accounts()
+            """Manually refresh accounts from database."""
+            ensure_duo_running()
+            self.accounts = get_duo_accounts()
             self.refresh_codes(None)
 
 
-def run_simple_mode():
-    print("Running in Diagnostic Mode")
+def run_terminal_mode():
+    """Run in terminal mode without rumps."""
+    print("Duo TOTP Codes (Terminal Mode)")
+    print("Press Ctrl+C to exit\n")
+
+    ensure_duo_running()
+    accounts = get_duo_accounts()
+
+    if not accounts:
+        print("No Duo accounts found!")
+        print(f"Database path: {PLAYCOVER_DB}")
+        return
+
     while True:
         os.system('clear')
-        accounts = get_db_accounts()
+        remaining = time_remaining()
 
-        if not accounts:
-            print("No accounts found in database")
-            print(f"Database: {PLAYCOVER_DB}")
+        print("Duo TOTP Codes")
+        print("=" * 40)
 
-        for acc in accounts:
-            s_raw = acc['raw_secret']
-            print(f"--- {acc['name']} ---")
+        for account in accounts:
+            code = totp(account['secret'])
+            formatted_code = f"{code[:3]} {code[3:]}"
+            print(f"{account['name']}: {formatted_code}")
 
-            try:
-                b_hex = bytes.fromhex(s_raw)
-                print(f"Hex/6: {totp(b_hex)}")
-            except:
-                pass
+        print(f"\nRefreshes in {remaining}s")
+        print("\nPress Ctrl+C to exit")
 
-            print(f"Raw/6: {totp(s_raw.encode('utf-8'))}")
-
-        print(f"\nRefreshes in {time_remaining()}s")
         time.sleep(1)
 
 
 def main():
     if HAS_RUMPS:
-        DuoMenuBarApp().run()
+        app = DuoMenuBarApp()
+        app.run()
     else:
-        run_simple_mode()
+        print("rumps not installed. Install with: pip3 install rumps")
+        print("Running in terminal mode instead...\n")
+        run_terminal_mode()
 
 
 if __name__ == "__main__":
