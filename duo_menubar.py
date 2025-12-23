@@ -97,6 +97,21 @@ def open_duo_app():
         subprocess.run(['cliclick', f'dc:{position}'])
 
 
+def close_duo_and_playcover():
+    """Close Duo Mobile and PlayCover apps."""
+    # Kill Duo Mobile process
+    subprocess.run(['pkill', '-f', 'com.duosecurity.DuoMobile'], capture_output=True)
+    time.sleep(0.5)
+
+    # Quit PlayCover gracefully using AppleScript
+    script = '''
+    tell application "PlayCover"
+        quit
+    end tell
+    '''
+    subprocess.run(['osascript', '-e', script], capture_output=True)
+
+
 def ensure_duo_running():
     """Make sure Duo app is running, open it if not."""
     if not is_duo_running():
@@ -143,10 +158,15 @@ if HAS_RUMPS:
             icon_path = str(MENUBAR_ICON) if MENUBAR_ICON.exists() else None
             super().__init__("", icon=icon_path, quit_button=None, template=False)
 
-            # Ensure Duo is running on startup
+            # Ensure Duo is running on startup to populate database
             ensure_duo_running()
 
             self.accounts = get_duo_accounts()
+
+            # Close Duo and PlayCover after getting accounts
+            if self.accounts:
+                close_duo_and_playcover()
+
             self.timer = rumps.Timer(self.refresh_codes, 1)
             self.timer.start()
             self.refresh_codes(None)
@@ -195,16 +215,27 @@ if HAS_RUMPS:
             rumps.notification("Duo Code Copied", "", f"Code {code} copied to clipboard")
 
         def open_duo(self, _):
-            """Open Duo app."""
+            """Open Duo app, refresh accounts, then close."""
             open_duo_app()
             # Wait and refresh accounts
             time.sleep(3)
-            self.manual_refresh(None)
+            self.accounts = get_duo_accounts()
+
+            # Close after getting accounts
+            if self.accounts:
+                close_duo_and_playcover()
+
+            self.refresh_codes(None)
 
         def manual_refresh(self, _):
             """Manually refresh accounts from database."""
             ensure_duo_running()
             self.accounts = get_duo_accounts()
+
+            # Close after getting accounts
+            if self.accounts:
+                close_duo_and_playcover()
+
             self.refresh_codes(None)
 
 
@@ -215,6 +246,10 @@ def run_terminal_mode():
 
     ensure_duo_running()
     accounts = get_duo_accounts()
+
+    # Close Duo and PlayCover after getting accounts
+    if accounts:
+        close_duo_and_playcover()
 
     if not accounts:
         print("No Duo accounts found!")
