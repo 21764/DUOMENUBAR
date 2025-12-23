@@ -16,6 +16,7 @@ from pathlib import Path
 
 try:
     import rumps
+    from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
     HAS_RUMPS = True
 except ImportError:
     HAS_RUMPS = False
@@ -276,6 +277,8 @@ def run_terminal_mode():
 
 def main():
     if HAS_RUMPS:
+        # Hide dock icon - make this an accessory app (menu bar only)
+        NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
         app = DuoMenuBarApp()
         app.run()
     else:
